@@ -685,6 +685,93 @@
     return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
   }
 
+  // Some browsers (notably several iOS/WebKit versions) either don't
+  // support canvas 2D's ctx.filter at all, or silently ignore an unrecognised
+  // filter string — either way `blur()`/`contrast()` end up doing nothing,
+  // with no error, and the "liquid merge" degrades to plain solid circles.
+  // Detect this once up front by actually running a tiny blur and checking
+  // whether it bled any brightness where it should have, so we can fall
+  // back to a manual JS blur on those browsers instead of silently failing.
+  function detectCanvasFilterSupport() {
+    try {
+      const size = 12;
+      const src = document.createElement("canvas");
+      src.width = size;
+      src.height = size;
+      const sctx = src.getContext("2d");
+      sctx.fillStyle = "#000";
+      sctx.fillRect(0, 0, size, size);
+      sctx.fillStyle = "#fff";
+      sctx.fillRect(5, 5, 2, 2);
+
+      const dst = document.createElement("canvas");
+      dst.width = size;
+      dst.height = size;
+      const dctx = dst.getContext("2d");
+      dctx.filter = "blur(3px)";
+      dctx.drawImage(src, 0, 0);
+      dctx.filter = "none";
+
+      // 3px from the white square — a real blur(3px) should bleed some
+      // brightness this close; a no-op filter leaves it pure black (0)
+      return dctx.getImageData(2, 2, 1, 1).data[0] > 8;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  const canvasFilterSupported = detectCanvasFilterSupport();
+  if (!canvasFilterSupported) {
+    console.info("Liquid merge: canvas filter() unsupported here — using manual blur fallback.");
+  }
+
+  // Separable box blur (horizontal pass + vertical pass) over a single
+  // channel of RGBA pixel data — used as the manual fallback for the blur
+  // step. Only channel 0 is touched since the mask is grayscale (R=G=B)
+  // and only channel 0 is read back as luminance afterwards.
+  function boxBlurChannel0(data, width, height, radius) {
+    const diameter = radius * 2 + 1;
+    const tmp = new Float32Array(width * height);
+
+    for (let y = 0; y < height; y++) {
+      const rowStart = y * width;
+      let sum = 0;
+      for (let i = -radius; i <= radius; i++) {
+        const x = Math.min(width - 1, Math.max(0, i));
+        sum += data[(rowStart + x) * 4];
+      }
+      for (let x = 0; x < width; x++) {
+        tmp[rowStart + x] = sum / diameter;
+        const addX = Math.min(width - 1, x + radius + 1);
+        const subX = Math.max(0, x - radius);
+        sum += data[(rowStart + addX) * 4] - data[(rowStart + subX) * 4];
+      }
+    }
+
+    for (let x = 0; x < width; x++) {
+      let sum = 0;
+      for (let i = -radius; i <= radius; i++) {
+        const y = Math.min(height - 1, Math.max(0, i));
+        sum += tmp[y * width + x];
+      }
+      for (let y = 0; y < height; y++) {
+        data[(y * width + x) * 4] = sum / diameter;
+        const addY = Math.min(height - 1, y + radius + 1);
+        const subY = Math.max(0, y - radius);
+        sum += tmp[addY * width + x] - tmp[subY * width + x];
+      }
+    }
+  }
+
+  // Matches CSS contrast()'s semantics (1 = no change), applied by hand to
+  // channel 0 only, for the manual fallback path.
+  function applyContrastChannel0(data, amount) {
+    for (let i = 0; i < data.length; i += 4) {
+      const v = (data[i] / 255 - 0.5) * amount + 0.5;
+      data[i] = Math.max(0, Math.min(255, v * 255));
+    }
+  }
+
   // The gooey "liquid merge" look, done in two stages to avoid a colour-
   // fringing artifact: blur+contrast applied directly to two differently-
   // hued flat colours can push each RGB channel past its threshold at a
@@ -725,12 +812,23 @@
     const bw = Math.min(W, Math.ceil(CX + PHYSICS_RADIUS + pad)) - bx;
     const bh = Math.min(H, Math.ceil(CY + PHYSICS_RADIUS + pad)) - by;
 
-    liquidCtx.clearRect(bx, by, bw, bh);
-    liquidCtx.filter = `blur(${blurPx}px) contrast(${CONFIG.liquidMergeContrast})`;
-    liquidCtx.drawImage(metaballCanvas, bx, by, bw, bh, bx, by, bw, bh);
-    liquidCtx.filter = "none";
+    let img;
+    if (canvasFilterSupported) {
+      liquidCtx.clearRect(bx, by, bw, bh);
+      liquidCtx.filter = `blur(${blurPx}px) contrast(${CONFIG.liquidMergeContrast})`;
+      liquidCtx.drawImage(metaballCanvas, bx, by, bw, bh, bx, by, bw, bh);
+      liquidCtx.filter = "none";
+      img = liquidCtx.getImageData(bx, by, bw, bh);
+    } else {
+      // manual fallback: box-blur + contrast by hand, entirely in JS, for
+      // browsers where ctx.filter is unsupported or silently a no-op
+      img = metaballCtx.getImageData(bx, by, bw, bh);
+      const r = Math.max(1, Math.round(blurPx));
+      boxBlurChannel0(img.data, bw, bh, r);
+      boxBlurChannel0(img.data, bw, bh, r);
+      applyContrastChannel0(img.data, CONFIG.liquidMergeContrast);
+    }
 
-    const img = liquidCtx.getImageData(bx, by, bw, bh);
     const data = img.data;
     const [cr, cg, cb] = hexToRgb(CONFIG.circleColor);
     for (let i = 0; i < data.length; i += 4) {
