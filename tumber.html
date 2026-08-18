@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Clockface</title>
+<link rel="stylesheet" href="clockface-panel.css">
+</head>
+<body>
+<canvas id="clock"></canvas>
+
+<div id="configPanel">
+  <button id="configToggle" type="button">
+    <span class="cfg-icon">
+      <svg width="15" height="15" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+        <line x1="3" y1="5" x2="17" y2="5"/><circle cx="12" cy="5" r="2" fill="currentColor" stroke="none"/>
+        <line x1="3" y1="10" x2="17" y2="10"/><circle cx="7" cy="10" r="2" fill="currentColor" stroke="none"/>
+        <line x1="3" y1="15" x2="17" y2="15"/><circle cx="14" cy="15" r="2" fill="currentColor" stroke="none"/>
+      </svg>
+    </span>
+    Settings
+    <span class="chev">
+      <svg width="10" height="10" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 8 10 13 15 8"/></svg>
+    </span>
+  </button>
+  <div id="configBody">
+    <div id="configScroll">
+      <div id="configControls"></div>
+      <button id="configReset" type="button">Reset to defaults</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/matter-js@0.19.0/build/matter.min.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  // ============================================================
+  // CONFIG — tweak these to change the clockface's look & feel.
+  //
+  // Concept: the time is written out as loose individual digit
+  // glyphs (hour = black/extra-bold, minute = bold, second = light)
+  // that spawn at random spots inside the dial and tumble around as
+  // physics bodies, nestling tightly against each other like kerned
+  // type. Once a second the whole dial "clicks" forward a notch
+  // (60 clicks = one full turn per minute) and every digit gets a
+  // tangential kick, as if dragged by a rotating drum. When the
+  // minute rolls over, the whole set shrinks away and a fresh set
+  // spawns showing the new time.
+  // ============================================================
+  const CONFIG = {
+    // ---- colour palette ----
+    backgroundColor: "#f04242",     // clock face background, inside the circle
+    pageBackgroundColor: "#ffffff", // page background, behind/around the clock face
+    hourColor: "#111111",           // extra-bold hour digits
+    minuteColor: "#111111",         // bold minute digits
+    secondColor: "#ffffff",         // light second digits
+    tickColor: "#ffffff",           // subtle rotating tick marks around the rim
+    borderEnabled: false,
+    borderColor: "#1C1C1E",
+
+    // ---- physics ----
+    gravity: 0.6,             // downward pull on digits (0 = weightless, 1 = normal)
+    restitution: 0.4,         // bounciness (0 = no bounce, 1 = perfectly bouncy)
+    friction: 0.12,           // surface friction between digits/walls — kept low so they keep sliding/rotating instead of locking flat
+    frictionAir: 0.008,       // air drag, slows everything down over time
+    density: 0.0015,          // mass per area
+
+    // ---- spawn behaviour ----
+    spawnLocation: "random",  // "random" = born at a random point on the face, "center" = born at the pivot
+    burstSpeedMin: 1,         // slowest possible launch speed on spawn
+    burstSpeedMax: 4,         // fastest possible launch speed on spawn
+    spinMax: 0.2,             // max random spin (angular velocity) applied on spawn
+    initialTiltMax: 0.55,     // max random starting angle (radians) so digits don't all spawn perfectly upright
+    collisionShrink: 0.8,    // physics box vs visual textbox size (<1 gives a little breathing room between neighbours)
+    // gap between the two digits in a pair, relative to their average width
+    // — low = tight/overlapping like the reference. Separate per tier.
+    hourKerningFactor: 0.66,
+    minuteKerningFactor: 0.8,
+    secondKerningFactor: 0.8,
+
+    // ---- preview: force the hour textbox to a single- or double-digit test
+    // value instead of the live hour, so its two size factors below can be
+    // tuned without waiting for the clock to actually reach that digit count.
+    hourPreview: "live", // "live" | "single" | "double"
+
+    // ---- numeral weights & sizing (relative to clockface RADIUS) ----
+    hourFontSizeFactor: 1.6,        // hour size when it's showing two digits (10, 11, 12...)
+    hourFontSizeFactorSingle: 2,  // hour size when it's showing just one digit (1-9)
+    minuteFontSizeFactor: 0.88,
+    secondFontSizeFactor: 0.52,
+    hourFontWeight: "900",     // extra bold / black
+    minuteFontWeight: "500",   // bold
+    secondFontWeight: "300",   // light
+    fontFamily: "'Helvetica Neue', Arial, sans-serif",
+
+    // ---- once-a-second "click" rotation ----
+    rotationEnabled: true,     // the whole dial advances one notch every second (full turn per minute)
+    clickDurationMs: 180,      // how long each notch's snap animation takes
+    kickStrength: 0.2,         // strength of the tangential physics kick applied to digits on each click
+    rotationReverse: false,    // flip rotation direction (counter-clockwise)
+
+    // ---- birth / death animation (per-minute respawn) ----
+    birthAnimationEnabled: true,
+    birthDurationMs: 560,
+    deathAnimationEnabled: true,
+    deathDurationMs: 360,
+    deathStaggerMs: 200,       // digits start dying at random times within this window, not all at once
+    tierRespawnStaggerMs: 400, // *additional* wait added on top of the minute's own guaranteed despawn-complete delay, so it lands even further behind the hour on minute rollover
+
+    // ---- clockface layout ----
+    clockRadiusFactor: 0.92,      // visible clockface radius, relative to half the shorter viewport side
+    physicsOvershootFactor: 1.06, // physics containment radius vs visible radius
+    borderWidthFactor: 0.012,
+    borderWidthMin: 2,
+
+    // ---- rim ticks ----
+    ticksEnabled: true,
+    tickOuterRadiusFactor: 0.97,
+    hourTickLengthFactor: 0.045,
+    minuteTickLengthFactor: 0.018,
+    hourTickWidthFactor: 0.006,
+    minuteTickWidthFactor: 0.005,
+
+    // ---- boundary wall construction (rarely needs tweaking) ----
+    wallSegments: 90,
+    wallThickness: 50,
+    wallChordOverlap: 1.15,
+
+    debugCenterDot: false,
+  };
+
+  // ---------- setup ----------
+  const { Engine, World, Bodies, Body, Composite } = Matter;
+
+  const canvas = document.getElementById("clock");
+  const ctx = canvas.getContext("2d");
+
+  let W = window.innerWidth;
+  let H = window.innerHeight;
+  canvas.width = W;
+  canvas.height = H;
+
+  // center + radius of the visible clockface circle
+  let CX = W / 2, CY = H / 2, RADIUS = 0;
+  let PHYSICS_RADIUS = 0;
+
+  const engine = Engine.create();
+  const world = engine.world;
+  world.gravity.y = CONFIG.gravity;
+
+  // ---------- walls ----------
+  // Approximate a circular boundary with a ring of static rectangular segments.
+  let walls = [];
+  function buildWalls() {
+    Composite.remove(world, walls);
+    walls = [];
+    const segments = CONFIG.wallSegments;
+    const thickness = CONFIG.wallThickness;
+    for (let i = 0; i < segments; i++) {
+      const angle = (i / segments) * Math.PI * 2;
+      const chord = (2 * Math.PI * PHYSICS_RADIUS) / segments;
+      const segX = CX + Math.cos(angle) * (PHYSICS_RADIUS + thickness / 2);
+      const segY = CY + Math.sin(angle) * (PHYSICS_RADIUS + thickness / 2);
+      const seg = Bodies.rectangle(segX, segY, chord * CONFIG.wallChordOverlap, thickness, {
+        isStatic: true,
+        angle: angle + Math.PI / 2,
+      });
+      walls.push(seg);
+    }
+    Composite.add(world, walls);
+  }
+
+  // ---------- digit metrics ----------
+  // Character bounding boxes, measured per weight tier, recomputed whenever
+  // the clockface radius or font settings change.
+  let DIGIT_METRICS = { hour: {}, minute: {}, second: {} };
+  // Per-tier layout (gap + offsets for the two-character string), built from
+  // the tier's *average* digit width rather than the specific pair on show —
+  // so a tier's textbox geometry never changes when its digits swap in place.
+  let PAIR_LAYOUT = { hour: null, minute: null, second: null };
+
+  function weightForTier(tier) {
+    return tier === "hour" ? CONFIG.hourFontWeight : tier === "minute" ? CONFIG.minuteFontWeight : CONFIG.secondFontWeight;
+  }
+  function colorForTier(tier) {
+    return tier === "hour" ? CONFIG.hourColor : tier === "minute" ? CONFIG.minuteColor : CONFIG.secondColor;
+  }
+  function sizeFactorForTier(tier) {
+    return tier === "hour" ? CONFIG.hourFontSizeFactor : tier === "minute" ? CONFIG.minuteFontSizeFactor : CONFIG.secondFontSizeFactor;
+  }
+  function kerningFactorForTier(tier) {
+    return tier === "hour" ? CONFIG.hourKerningFactor : tier === "minute" ? CONFIG.minuteKerningFactor : CONFIG.secondKerningFactor;
+  }
+
+  // Measures a tier's 0-9 glyphs at a given font size, returning both the
+  // per-digit metrics and the aggregate (average width / max height) used
+  // to build a two-character pair layout.
+  function measureTierDigits(tier, size) {
+    ctx.font = `${weightForTier(tier)} ${size}px ${CONFIG.fontFamily}`;
+    const perDigit = {};
+    let widthSum = 0, heightMax = 0;
+    for (let d = 0; d <= 9; d++) {
+      const ch = String(d);
+      const tm = ctx.measureText(ch);
+      const ascent = tm.actualBoundingBoxAscent || size * 0.72;
+      const descent = tm.actualBoundingBoxDescent || size * 0.06;
+      const width = tm.width || size * 0.6;
+      const height = ascent + descent;
+      perDigit[ch] = { width, height, size };
+      widthSum += width;
+      heightMax = Math.max(heightMax, height);
+    }
+    return { perDigit, avgWidth: widthSum / 10, heightMax };
+  }
+
+  function computeDigitMetrics() {
+    DIGIT_METRICS = { hour: {}, minute: {}, second: {} };
+    for (const tier of ["hour", "minute", "second"]) {
+      const pairSize = RADIUS * sizeFactorForTier(tier);
+
+      // Only the hour ever shows as a single digit, and it gets its own
+      // dedicated size for that case; minute/second always show two digits,
+      // so their single-digit metrics (unused) just match the pair size.
+      const singleSize = tier === "hour" ? RADIUS * CONFIG.hourFontSizeFactorSingle : pairSize;
+      DIGIT_METRICS[tier] = measureTierDigits(tier, singleSize).perDigit;
+
+      const { avgWidth, heightMax } = measureTierDigits(tier, pairSize);
+      const gap = avgWidth * kerningFactorForTier(tier);
+      PAIR_LAYOUT[tier] = {
+        size: pairSize,
+        gap,
+        c0x: -gap / 2,
+        c1x: gap / 2,
+        width: gap + avgWidth,
+        height: heightMax,
+      };
+    }
+  }
+
+  // ---------- digit glyphs (physics bodies) ----------
+  let digitBodies = [];
+  let lastSecond = -1;
+  let started = false;
+
+  function easeOutBack(t) {
+    t = Math.min(Math.max(t, 0), 1);
+    const c1 = 1.70158, c3 = c1 + 1;
+    return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+  }
+  function easeInQuad(t) {
+    t = Math.min(Math.max(t, 0), 1);
+    return t * t;
+  }
+  function easeOutCubic(t) {
+    t = Math.min(Math.max(t, 0), 1);
+    return 1 - Math.pow(1 - t, 3);
+  }
+
+  // Does a candidate spawn point's textbox overlap any body that's already
+  // settled (or settling) on the face? Dying bodies are shrinking away and
+  // about to be removed, so they don't count — spawning near one is fine.
+  function overlapsExisting(point, halfDiag) {
+    for (const body of digitBodies) {
+      if (body.dyingAt !== undefined) continue;
+      const dx = point.x - body.position.x, dy = point.y - body.position.y;
+      const dist = Math.hypot(dx, dy);
+      const otherHalfDiag = Math.hypot(body.colliderW, body.colliderH) / 2;
+      if (dist < (halfDiag + otherHalfDiag) * 0.85) return true;
+    }
+    return false;
+  }
+
+  // Picks a random point inside the face, trying a handful of candidates and
+  // preferring the first one that doesn't land right on top of an existing
+  // textbox — landing two large, heavy bodies flush against each other at
+  // birth is what tends to jam them together instead of letting them settle.
+  function randomSpawnPoint(halfDiag) {
+    const maxSpawnRadius = Math.max(RADIUS - halfDiag - 4, 0);
+    let fallback = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const spawnRadius = Math.sqrt(Math.random()) * maxSpawnRadius;
+      const angle = Math.random() * Math.PI * 2;
+      const point = { x: CX + Math.cos(angle) * spawnRadius, y: CY + Math.sin(angle) * spawnRadius };
+      if (!overlapsExisting(point, halfDiag)) return point;
+      fallback = point;
+    }
+    return fallback;
+  }
+
+  // Each number (hour/minute/second) is a single physics body — one textbox
+  // holding both characters at a fixed, tightly-kerned offset — rather than
+  // two separate glyphs glued together. That keeps it as one simple rigid
+  // shape (so it tumbles and spins like any other single object) instead of
+  // a two-legged compound that tends to land flat and stay put.
+  // Most tiers always show two digits, using the tier's average-width layout
+  // so their textbox geometry stays stable when characters swap in place. A
+  // single-character number (e.g. an unpadded hour like "9") just uses that
+  // one glyph's own metrics instead, centred with no gap. Shared by spawning
+  // and by live config edits that need to re-lay-out already-spawned bodies.
+  function layoutForChars(tier, chars) {
+    if (chars.length === 1) {
+      const m = DIGIT_METRICS[tier][chars[0]];
+      return { width: m.width, height: m.height, size: m.size, charOffsets: [0] };
+    }
+    const layout = PAIR_LAYOUT[tier];
+    return { width: layout.width, height: layout.height, size: layout.size, charOffsets: [layout.c0x, layout.c1x] };
+  }
+
+  function spawnPair(tier, chars) {
+    const { width, height, size, charOffsets } = layoutForChars(tier, chars);
+
+    const halfDiag = Math.hypot(width, height) / 2;
+    const spawn = CONFIG.spawnLocation === "center" ? { x: CX, y: CY } : randomSpawnPoint(halfDiag);
+
+    const w = Math.max(width * CONFIG.collisionShrink, 4);
+    const h = Math.max(height * CONFIG.collisionShrink, 4);
+    const body = Bodies.rectangle(spawn.x, spawn.y, w, h, {
+      restitution: CONFIG.restitution,
+      friction: CONFIG.friction,
+      frictionAir: CONFIG.frictionAir,
+      density: CONFIG.density,
+    });
+
+    body.tier = tier;
+    body.fontSize = size;
+    body.chars = chars.split("");
+    body.charOffsets = charOffsets;
+    body.colliderW = w;
+    body.colliderH = h;
+    body.deathScale = 1;
+
+    // Random initial tilt (rather than always spawning upright) plus a
+    // random spin & burst velocity, so digits land at lively, varied angles
+    // instead of all settling flat and square to the frame.
+    Body.setAngle(body, (Math.random() * 2 - 1) * CONFIG.initialTiltMax);
+    const angle = Math.random() * Math.PI * 2;
+    const speed = CONFIG.burstSpeedMin + Math.random() * (CONFIG.burstSpeedMax - CONFIG.burstSpeedMin);
+    Body.setVelocity(body, { x: Math.cos(angle) * speed, y: Math.sin(angle) * speed });
+    Body.setAngularVelocity(body, (Math.random() - 0.5) * CONFIG.spinMax);
+    body.bornAt = performance.now();
+
+    digitBodies.push(body);
+    Composite.add(world, body);
+    return body;
+  }
+
+  function currentTimeStrings() {
+    const now = new Date();
+    let h = now.getHours() % 12;
+    if (h === 0) h = 12;
+    let hh = String(h); // no leading zero on the hour
+
+    // Test override so the single-/double-digit hour sizes can be tuned
+    // on demand instead of waiting for the clock to reach that digit count.
+    if (CONFIG.hourPreview === "single") hh = "3";
+    else if (CONFIG.hourPreview === "double") hh = "12";
+
+    return {
+      hh,
+      mm: String(now.getMinutes()).padStart(2, "0"),
+      ss: String(now.getSeconds()).padStart(2, "0"),
+    };
+  }
+
+  // The second textbox is a single long-lived body most of the time — its
+  // characters are swapped in place every second (see updateSecondsIfNeeded)
+  // rather than despawning — so it's tracked separately. It does get a full
+  // despawn/respawn into a new random position at minute rollover, same as
+  // hour/minute; onSpawned below is how resetTier hands back the fresh body.
+  let secondBody = null;
+
+  function spawnAllDigits() {
+    const { hh, mm, ss } = currentTimeStrings();
+    spawnPair("hour", hh);
+    spawnPair("minute", mm);
+    secondBody = spawnPair("second", ss);
+  }
+
+  // Marks every current pair of a given tier to shrink away over the next
+  // little while, at a random staggered start time each. The fresh pair's
+  // spawn is held off until every one of those outgoing bodies has actually
+  // finished shrinking and been removed — computed directly from their own
+  // dyingAt + deathDurationMs, not a guessed fixed delay — so the new
+  // textbox is guaranteed to never appear before the old one is fully gone.
+  // extraDelayMs adds further wait on top of that (used to keep hour and
+  // minute from both landing at the exact same moment on minute rollover).
+  // onSpawned, if given, is called with the freshly-spawned body once it
+  // actually exists (immediately, or after the computed delay).
+  function resetTier(tier, chars, extraDelayMs = 0, onSpawned) {
+    let spawnDelayMs = 0;
+
+    if (CONFIG.deathAnimationEnabled) {
+      const now = performance.now();
+      let latestRemovalAt = now;
+      for (const body of digitBodies) {
+        if (body.tier === tier && body.dyingAt === undefined) {
+          body.dyingAt = now + Math.random() * CONFIG.deathStaggerMs;
+          latestRemovalAt = Math.max(latestRemovalAt, body.dyingAt + CONFIG.deathDurationMs);
+        }
+      }
+      spawnDelayMs = latestRemovalAt - now;
+    } else {
+      for (let i = digitBodies.length - 1; i >= 0; i--) {
+        if (digitBodies[i].tier === tier) {
+          Composite.remove(world, digitBodies[i]);
+          digitBodies.splice(i, 1);
+        }
+      }
+    }
+
+    spawnDelayMs += extraDelayMs;
+    const doSpawn = () => {
+      const body = spawnPair(tier, chars);
+      if (onSpawned) onSpawned(body);
+    };
+    if (spawnDelayMs > 0) {
+      setTimeout(doSpawn, spawnDelayMs);
+    } else {
+      doSpawn();
+    }
+  }
+
+  // Safety net: the wall ring is approximated from straight segments, and a
+  // fast or oversized body can occasionally punch through it (especially at
+  // large font sizes) and end up drifting outside the face for good. Each
+  // frame, anything that strays too far past the physics boundary gets
+  // pulled back in and calmed down, so it always recovers on its own.
+  function containBodies() {
+    const maxR = PHYSICS_RADIUS + 60;
+    for (const body of digitBodies) {
+      const dx = body.position.x - CX, dy = body.position.y - CY;
+      const dist = Math.hypot(dx, dy);
+      if (dist <= maxR) continue;
+      const nx = dist > 0 ? dx / dist : 1, ny = dist > 0 ? dy / dist : 0;
+      Body.setPosition(body, { x: CX + nx * RADIUS * 0.5, y: CY + ny * RADIUS * 0.5 });
+      Body.setVelocity(body, { x: 0, y: 0 });
+      Body.setAngularVelocity(body, 0);
+    }
+  }
+
+  function updateDyingDigits(now) {
+    for (let i = digitBodies.length - 1; i >= 0; i--) {
+      const body = digitBodies[i];
+      if (body.dyingAt === undefined || now < body.dyingAt) continue;
+
+      const t = (now - body.dyingAt) / CONFIG.deathDurationMs;
+      if (t >= 1) {
+        Composite.remove(world, body);
+        digitBodies.splice(i, 1);
+        continue;
+      }
+
+      const targetScale = 1 - easeInQuad(t);
+      const factor = targetScale / body.deathScale;
+      Body.scale(body, factor, factor);
+      body.deathScale = targetScale;
+    }
+  }
+
+  // ---------- once-a-second "click" rotation ----------
+  // The dial's decorative rim (ticks) visually rotates one notch per second,
+  // easing through a short "click"; every digit also gets a tangential
+  // velocity kick scaled by its distance from the pivot, as if it had just
+  // been dragged along by a rotating drum wall.
+  let faceRotationStart = 0;
+  let faceRotationTarget = 0;
+  let clickStartTime = 0;
+
+  function currentFaceRotation(now) {
+    const t = Math.min(Math.max((now - clickStartTime) / CONFIG.clickDurationMs, 0), 1);
+    return faceRotationStart + (faceRotationTarget - faceRotationStart) * easeOutCubic(t);
+  }
+
+  function triggerClick() {
+    if (!CONFIG.rotationEnabled) return;
+    const now = performance.now();
+    const dir = CONFIG.rotationReverse ? -1 : 1;
+
+    faceRotationStart = currentFaceRotation(now);
+    faceRotationTarget = faceRotationStart + (Math.PI * 2 / 60) * dir;
+    clickStartTime = now;
+
+    if (CONFIG.kickStrength <= 0) return;
+
+    for (const body of digitBodies) {
+      const dx = body.position.x - CX, dy = body.position.y - CY;
+      const r = Math.hypot(dx, dy);
+      if (r < 1) continue;
+      const tx = -dy / r, ty = dx / r; // tangent unit vector
+      const speed = CONFIG.kickStrength * (r / RADIUS) * 6 * dir;
+      Body.setVelocity(body, { x: body.velocity.x + tx * speed, y: body.velocity.y + ty * speed });
+      Body.setAngularVelocity(body, body.angularVelocity + (Math.random() - 0.5) * 0.4 * dir * CONFIG.kickStrength);
+    }
+  }
+
+  // Spawn is driven by the real clock second, so the click always lines up
+  // exactly with the real second hand. Most seconds just swap the second
+  // textbox's characters in place, keeping its position/velocity/spin. At
+  // minute rollover, all three tiers get a full de-spawn/respawn into new
+  // random positions.
+  function updateSecondsIfNeeded() {
+    const second = new Date().getSeconds();
+    if (second === lastSecond) return;
+    lastSecond = second;
+    triggerClick();
+    const { hh, mm, ss } = currentTimeStrings();
+    if (second === 0) {
+      resetTier("hour", hh, 0);
+      resetTier("minute", mm, CONFIG.tierRespawnStaggerMs);
+      resetTier("second", ss, 0, (body) => { secondBody = body; });
+    } else if (secondBody) {
+      secondBody.chars = [ss[0], ss[1]];
+    }
+  }
+
+  // ---------- rendering ----------
+
+  function drawTicks(now) {
+    const rot = currentFaceRotation(now);
+    ctx.save();
+    ctx.translate(CX, CY);
+    ctx.rotate(rot);
+    ctx.fillStyle = CONFIG.tickColor;
+    for (let i = 0; i < 60; i++) {
+      const angle = (i / 60) * Math.PI * 2 - Math.PI / 2;
+      const isHour = i % 5 === 0;
+      const outer = RADIUS * CONFIG.tickOuterRadiusFactor;
+      const inner = outer - RADIUS * (isHour ? CONFIG.hourTickLengthFactor : CONFIG.minuteTickLengthFactor);
+      const width = RADIUS * (isHour ? CONFIG.hourTickWidthFactor : CONFIG.minuteTickWidthFactor);
+      ctx.save();
+      ctx.rotate(angle);
+      ctx.beginPath();
+      ctx.roundRect(inner, -width / 2, outer - inner, width, width / 2);
+      ctx.fill();
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  function drawDigitBody(body, now) {
+    let birthScale = 1;
+    if (CONFIG.birthAnimationEnabled) {
+      const age = now - body.bornAt;
+      if (age < CONFIG.birthDurationMs) birthScale = Math.max(easeOutBack(age / CONFIG.birthDurationMs), 0);
+    }
+    const fontSize = body.fontSize * body.deathScale;
+    if (fontSize <= 0.5 || birthScale <= 0) return;
+
+    ctx.save();
+    ctx.translate(body.position.x, body.position.y);
+    ctx.rotate(body.angle);
+    ctx.scale(birthScale, birthScale);
+    ctx.font = `${weightForTier(body.tier)} ${fontSize}px ${CONFIG.fontFamily}`;
+    ctx.fillStyle = colorForTier(body.tier);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (let i = 0; i < body.chars.length; i++) {
+      ctx.fillText(body.chars[i], body.charOffsets[i], 0);
+    }
+    ctx.restore();
+  }
+
+  function draw(now) {
+    ctx.clearRect(0, 0, W, H);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(CX, CY, RADIUS, 0, Math.PI * 2);
+    ctx.clip();
+
+    ctx.fillStyle = CONFIG.backgroundColor;
+    ctx.fillRect(0, 0, W, H);
+
+    if (CONFIG.ticksEnabled) drawTicks(now);
+
+    for (const body of digitBodies) drawDigitBody(body, now);
+
+    ctx.restore();
+
+    if (CONFIG.borderEnabled) {
+      ctx.beginPath();
+      ctx.arc(CX, CY, RADIUS, 0, Math.PI * 2);
+      ctx.lineWidth = Math.max(RADIUS * CONFIG.borderWidthFactor, CONFIG.borderWidthMin);
+      ctx.strokeStyle = CONFIG.borderColor;
+      ctx.stroke();
+    }
+
+    if (CONFIG.debugCenterDot) {
+      ctx.beginPath();
+      ctx.arc(CX, CY, Math.max(RADIUS * 0.012, 3), 0, Math.PI * 2);
+      ctx.fillStyle = "red";
+      ctx.fill();
+    }
+  }
+
+  // ---------- main loop ----------
+
+  let lastTime = performance.now();
+  function tick(now) {
+    const delta = Math.min(now - lastTime, 33);
+    lastTime = now;
+    Engine.update(engine, delta);
+    containBodies();
+    updateSecondsIfNeeded();
+    updateDyingDigits(now);
+    draw(now);
+    requestAnimationFrame(tick);
+  }
+
+  // On first load, show the current time immediately (rather than an empty
+  // face waiting for the next minute), with the dial's click-rotation caught
+  // up to how many seconds have already elapsed this minute, then fast-
+  // forward the physics a bit so digits aren't just hanging frozen mid-air.
+  function preloadCurrentTime() {
+    const nowSec = new Date().getSeconds();
+    const dir = CONFIG.rotationReverse ? -1 : 1;
+    faceRotationStart = faceRotationTarget = (nowSec / 60) * Math.PI * 2 * dir;
+    clickStartTime = performance.now() - CONFIG.clickDurationMs;
+    lastSecond = nowSec;
+    spawnAllDigits();
+    for (let i = 0; i < 60; i++) Engine.update(engine, 16.67);
+  }
+
+  // On resize, reposition + rescale existing digits proportionally to the
+  // new geometry instead of wiping them out.
+  function rescaleDigits(oldCX, oldCY, oldRadius, newCX, newCY, newRadius) {
+    if (!oldRadius) return;
+    const factor = newRadius / oldRadius;
+    for (const body of digitBodies) {
+      const relX = (body.position.x - oldCX) * factor;
+      const relY = (body.position.y - oldCY) * factor;
+      Body.setPosition(body, { x: newCX + relX, y: newCY + relY });
+      Body.scale(body, factor, factor);
+      body.fontSize *= factor;
+      body.charOffsets = body.charOffsets.map(o => o * factor);
+      body.colliderW *= factor;
+      body.colliderH *= factor;
+    }
+  }
+
+  // Live-editing a numeral's size/weight/kerning/collider-tightness in the
+  // config panel should be visible immediately, not just on the next spawn —
+  // so re-lay-out every already-spawned body to the current CONFIG right
+  // away. Bodies mid-death keep their own shrink animation instead.
+  function relayoutDigits() {
+    for (const body of digitBodies) {
+      if (body.dyingAt !== undefined) continue;
+      const { width, height, size, charOffsets } = layoutForChars(body.tier, body.chars.join(""));
+      const newW = Math.max(width * CONFIG.collisionShrink, 4);
+      const newH = Math.max(height * CONFIG.collisionShrink, 4);
+      Body.scale(body, newW / body.colliderW, newH / body.colliderH);
+      body.colliderW = newW;
+      body.colliderH = newH;
+      body.fontSize = size;
+      body.charOffsets = charOffsets;
+    }
+  }
+
+  function applyPageBackground() {
+    document.body.style.background = CONFIG.pageBackgroundColor;
+  }
+
+  function init() {
+    const oldCX = CX, oldCY = CY, oldRadius = RADIUS;
+    applyPageBackground();
+
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    CX = W / 2;
+    CY = H / 2;
+    RADIUS = Math.min(W, H) / 2 * CONFIG.clockRadiusFactor;
+    PHYSICS_RADIUS = RADIUS * CONFIG.physicsOvershootFactor;
+    buildWalls();
+    computeDigitMetrics();
+
+    if (!started) {
+      started = true;
+      preloadCurrentTime();
+    } else {
+      rescaleDigits(oldCX, oldCY, oldRadius, CX, CY, RADIUS);
+    }
+  }
+
+  window.addEventListener("resize", init);
+
+  // ---------- live config panel ----------
+  const DEFAULT_CONFIG = JSON.parse(JSON.stringify(CONFIG));
+
+  const CONTROL_SCHEMA = [
+    { section: "Physics", controls: [
+      { key: "gravity", label: "Gravity", type: "range", min: 0, max: 2, step: 0.05 },
+      { key: "restitution", label: "Bounciness", type: "range", min: 0, max: 1, step: 0.05 },
+      { key: "friction", label: "Friction", type: "range", min: 0, max: 1, step: 0.05 },
+    ]},
+    { section: "Spawn", controls: [
+      { key: "spawnLocation", label: "Birth location", type: "select", options: ["random", "center"] },
+      { key: "burstSpeedMin", label: "Burst speed min", type: "range", min: 0, max: 20, step: 0.5 },
+      { key: "burstSpeedMax", label: "Burst speed max", type: "range", min: 0, max: 20, step: 0.5 },
+      { key: "spinMax", label: "Spin", type: "range", min: 0, max: 1, step: 0.02 },
+      { key: "initialTiltMax", label: "Initial tilt", type: "range", min: 0, max: 1.57, step: 0.05 },
+      { key: "minuteKerningFactor", label: "Kerning (minute)", type: "range", min: 0.1, max: 1.2, step: 0.02 },
+      { key: "secondKerningFactor", label: "Kerning (second)", type: "range", min: 0.1, max: 1.2, step: 0.02 },
+      { key: "hourKerningFactor", label: "Kerning (hour)", type: "range", min: 0.1, max: 1.2, step: 0.02 },
+      { key: "collisionShrink", label: "Collider tightness", type: "range", min: 0.5, max: 1, step: 0.02 },
+    ]},
+    { section: "Numerals", controls: [
+      { key: "hourPreview", label: "Preview hour digits", type: "select", options: ["live", "single", "double"] },
+      { key: "hourFontSizeFactor", label: "Hour size (2-digit)", type: "range", min: 0.2, max: 2, step: 0.01 },
+      { key: "hourFontSizeFactorSingle", label: "Hour size (1-digit)", type: "range", min: 0.2, max: 2, step: 0.01 },
+      { key: "minuteFontSizeFactor", label: "Minute size", type: "range", min: 0.15, max: 2, step: 0.01 },
+      { key: "secondFontSizeFactor", label: "Second size", type: "range", min: 0.1, max: 2, step: 0.01 },
+      { key: "hourFontWeight", label: "Hour weight", type: "select", options: ["700", "800", "900"] },
+      { key: "minuteFontWeight", label: "Minute weight", type: "select", options: ["400", "500", "600", "700"] },
+      { key: "secondFontWeight", label: "Second weight", type: "select", options: ["200", "300", "400"] },
+    ]},
+    { section: "Rotation", controls: [
+      { key: "rotationEnabled", label: "Click each second", type: "checkbox" },
+      { key: "rotationReverse", label: "Reverse direction", type: "checkbox" },
+      { key: "clickDurationMs", label: "Click duration (ms)", type: "range", min: 40, max: 500, step: 10 },
+      { key: "kickStrength", label: "Kick strength", type: "range", min: 0, max: 3, step: 0.05 },
+    ]},
+    { section: "Birth / Death", controls: [
+      { key: "birthAnimationEnabled", label: "Birth animation", type: "checkbox" },
+      { key: "birthDurationMs", label: "Birth duration (ms)", type: "range", min: 50, max: 800, step: 10 },
+      { key: "deathAnimationEnabled", label: "Death animation", type: "checkbox" },
+      { key: "deathDurationMs", label: "Death duration (ms)", type: "range", min: 50, max: 800, step: 10 },
+      { key: "deathStaggerMs", label: "Death stagger (ms)", type: "range", min: 0, max: 1000, step: 10 },
+      { key: "tierRespawnStaggerMs", label: "Extra minute delay after hour (ms)", type: "range", min: 0, max: 1000, step: 10 },
+    ]},
+    { section: "Face", controls: [
+      { key: "ticksEnabled", label: "Rim ticks", type: "checkbox" },
+    ]},
+    { section: "Colours", controls: [
+      { key: "pageBackgroundColor", label: "Page background", type: "color" },
+      { key: "backgroundColor", label: "Clock face background", type: "color" },
+      { key: "hourColor", label: "Hour digits", type: "color" },
+      { key: "minuteColor", label: "Minute digits", type: "color" },
+      { key: "secondColor", label: "Second digits", type: "color" },
+      { key: "tickColor", label: "Rim ticks", type: "color" },
+      { key: "borderEnabled", label: "Face outline", type: "checkbox" },
+      { key: "borderColor", label: "Outline colour", type: "color" },
+    ]},
+  ];
+
+  const REBUILD_WALLS_KEYS = new Set(["wallSegments", "wallThickness", "wallChordOverlap"]);
+  const REBUILD_METRICS_KEYS = new Set(["hourFontSizeFactor", "hourFontSizeFactorSingle", "minuteFontSizeFactor", "secondFontSizeFactor", "hourFontWeight", "minuteFontWeight", "secondFontWeight", "fontFamily", "hourKerningFactor", "minuteKerningFactor", "secondKerningFactor"]);
+  const RELAYOUT_KEYS = new Set([...REBUILD_METRICS_KEYS, "collisionShrink"]);
+
+  // Immediately re-spawns the hour textbox with whatever currentTimeStrings()
+  // resolves to right now (live hour, or the "single"/"double" test digits),
+  // instead of waiting for the next minute rollover — that's what makes the
+  // preview control instant.
+  // Bypasses the death animation entirely (instant remove + respawn) rather
+  // than going through resetTier's guaranteed-despawn-first wait — this is a
+  // debug/testing control, so it should swap on the spot, not make you wait
+  // out a death animation just to compare two sizes.
+  function refreshHourPreview() {
+    const { hh } = currentTimeStrings();
+    for (let i = digitBodies.length - 1; i >= 0; i--) {
+      if (digitBodies[i].tier === "hour") {
+        Composite.remove(world, digitBodies[i]);
+        digitBodies.splice(i, 1);
+      }
+    }
+    spawnPair("hour", hh);
+  }
+
+  function onConfigChange(key) {
+    if (key === "gravity") world.gravity.y = CONFIG.gravity;
+    if (key === "pageBackgroundColor") applyPageBackground();
+    if (REBUILD_WALLS_KEYS.has(key)) buildWalls();
+    if (REBUILD_METRICS_KEYS.has(key)) computeDigitMetrics();
+    if (RELAYOUT_KEYS.has(key)) relayoutDigits();
+    if (key === "hourPreview") refreshHourPreview();
+  }
+
+  function renderControls(container) {
+    container.innerHTML = "";
+    CONTROL_SCHEMA.forEach(section => {
+      const sectionEl = document.createElement("div");
+      sectionEl.className = "cfg-section";
+      const h4 = document.createElement("h4");
+      h4.textContent = section.section;
+      sectionEl.appendChild(h4);
+
+      section.controls.forEach(ctrl => {
+        const row = document.createElement("div");
+        row.className = "cfg-row";
+
+        const label = document.createElement("label");
+        label.textContent = ctrl.label;
+        row.appendChild(label);
+
+        if (ctrl.type === "range") {
+          const input = document.createElement("input");
+          input.type = "range";
+          input.min = ctrl.min;
+          input.max = ctrl.max;
+          input.step = ctrl.step;
+          input.value = CONFIG[ctrl.key];
+          const val = document.createElement("span");
+          val.className = "cfg-val";
+          val.textContent = CONFIG[ctrl.key];
+          input.addEventListener("input", () => {
+            CONFIG[ctrl.key] = parseFloat(input.value);
+            val.textContent = CONFIG[ctrl.key];
+            onConfigChange(ctrl.key);
+          });
+          row.appendChild(input);
+          row.appendChild(val);
+        } else if (ctrl.type === "checkbox") {
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.checked = !!CONFIG[ctrl.key];
+          input.addEventListener("change", () => {
+            CONFIG[ctrl.key] = input.checked;
+            onConfigChange(ctrl.key);
+          });
+          row.appendChild(input);
+        } else if (ctrl.type === "select") {
+          const input = document.createElement("select");
+          ctrl.options.forEach(opt => {
+            const o = document.createElement("option");
+            o.value = opt;
+            o.textContent = opt;
+            if (opt === CONFIG[ctrl.key]) o.selected = true;
+            input.appendChild(o);
+          });
+          input.addEventListener("change", () => {
+            CONFIG[ctrl.key] = input.value;
+            onConfigChange(ctrl.key);
+          });
+          row.appendChild(input);
+        } else if (ctrl.type === "color") {
+          const input = document.createElement("input");
+          input.type = "color";
+          input.value = CONFIG[ctrl.key];
+          input.addEventListener("input", () => {
+            CONFIG[ctrl.key] = input.value;
+            onConfigChange(ctrl.key);
+          });
+          row.appendChild(input);
+        }
+
+        sectionEl.appendChild(row);
+      });
+
+      container.appendChild(sectionEl);
+    });
+  }
+
+  function buildConfigPanel() {
+    const panel = document.getElementById("configPanel");
+    const toggle = document.getElementById("configToggle");
+    const controlsContainer = document.getElementById("configControls");
+    const resetBtn = document.getElementById("configReset");
+
+    toggle.addEventListener("click", () => panel.classList.toggle("open"));
+    document.addEventListener("click", (e) => {
+      if (panel.classList.contains("open") && !panel.contains(e.target)) {
+        panel.classList.remove("open");
+      }
+    });
+    renderControls(controlsContainer);
+
+    resetBtn.addEventListener("click", () => {
+      Object.assign(CONFIG, JSON.parse(JSON.stringify(DEFAULT_CONFIG)));
+      world.gravity.y = CONFIG.gravity;
+      applyPageBackground();
+      buildWalls();
+      computeDigitMetrics();
+      relayoutDigits();
+      refreshHourPreview();
+      renderControls(controlsContainer);
+    });
+  }
+
+  init();
+  buildConfigPanel();
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
